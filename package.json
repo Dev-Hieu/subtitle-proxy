@@ -1,1 +1,1 @@
-{ "name": "subtitle-proxy", "version": "1.0.0", "private": true }
+{"name":"subtitle-proxy","version":"1.0.0","private":true,"dependencies":{"youtube-transcript":"^1.3.1"}}
