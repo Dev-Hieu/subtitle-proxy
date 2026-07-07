@@ -3,48 +3,59 @@ export default async function handler(req, res) {
   if (!videoId || videoId.length !== 11) return res.status(400).json({ error: "missing v" });
   res.setHeader("Access-Control-Allow-Origin", "*");
 
+  // YouTube Data API v3 — dùng API key (miễn phí 10,000 quota/ngày)
+  const API_KEY = process.env.YOUTUBE_API_KEY;
+  if (!API_KEY) return res.status(500).json({ error: "missing YOUTUBE_API_KEY env" });
+
   try {
-    // Direct innertube API call — different user agent + consent bypass
-    const playerResp = await fetch("https://www.youtube.com/youtubei/v1/player", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Youtube-Client-Name": "1",
-        "X-Youtube-Client-Version": "2.20240101.00.00",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Origin": "https://www.youtube.com",
-        "Referer": "https://www.youtube.com/",
-      },
-      body: JSON.stringify({
-        context: {
-          client: {
-            clientName: "WEB",
-            clientVersion: "2.20240101.00.00",
-            hl: "en",
-            gl: "US",
-            userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-          },
-        },
-        videoId,
-      }),
-    });
-    const playerData = await playerResp.json();
-    const tracks = playerData?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+    // Step 1: Lấy danh sách caption tracks
+    const listResp = await fetch(
+      `https://www.googleapis.com/youtube/v3/captions?part=snippet&videoId=${videoId}&key=${API_KEY}`
+    );
+    const listData = await listResp.json();
     
-    if (tracks.length > 0) {
-      const en = tracks.find(t => (t.languageCode || "").startsWith("en")) || tracks[0];
-      const subUrl = en.baseUrl.replace(/\\u0026/g, "&");
-      const subResp = await fetch(subUrl);
-      const xml = await subResp.text();
+    if (listData.error) {
+      // API key error hoặc quota exceeded → fallback youtube-transcript
+      return await fallbackTranscript(videoId, res);
+    }
+
+    const tracks = listData.items || [];
+    const enTrack = tracks.find(t => 
+      (t.snippet?.language || "").startsWith("en") && t.snippet?.trackKind === "ASR"
+    ) || tracks.find(t => 
+      (t.snippet?.language || "").startsWith("en")
+    );
+
+    if (!enTrack) {
+      // Không có caption trong API → fallback
+      return await fallbackTranscript(videoId, res);
+    }
+
+    // Step 2: YouTube captions.download cần OAuth (không dùng API key được)
+    // → Dùng timedtext URL trực tiếp
+    const timedtextResp = await fetch(
+      `https://www.youtube.com/api/timedtext?v=${videoId}&lang=en&fmt=srv3&key=${API_KEY}`
+    );
+    const xml = await timedtextResp.text();
+    
+    if (xml && xml.includes("<text")) {
       const sentences = parseXml(xml);
       if (sentences.length > 0) {
-        return res.json({ videoId, sentences, count: sentences.length, method: "innertube", lang: en.languageCode });
+        return res.json({ videoId, sentences, count: sentences.length, method: "youtube-api" });
       }
     }
 
-    // Fallback: youtube-transcript package
+    // Fallback
+    return await fallbackTranscript(videoId, res);
+  } catch (e) {
+    return res.status(502).json({ error: e.message || "failed" });
+  }
+}
+
+async function fallbackTranscript(videoId, res) {
+  try {
     const { YoutubeTranscript } = await import("youtube-transcript");
-    for (const lang of ["en", "en-US", ""]) {
+    for (const lang of ["en", ""]) {
       try {
         const items = await YoutubeTranscript.fetchTranscript(videoId, lang ? { lang } : {});
         if (items?.length) {
@@ -53,38 +64,12 @@ export default async function handler(req, res) {
             end: Math.round((i.offset + i.duration) / 100) / 10,
             text: i.text.replace(/\n/g, " ").trim(),
           })).filter(s => s.text);
-          return res.json({ videoId, sentences, count: sentences.length, method: "yt-transcript", lang: lang || "auto" });
+          return res.json({ videoId, sentences, count: sentences.length, method: "yt-transcript" });
         }
-      } catch { /* try next */ }
+      } catch { /* next */ }
     }
-
-    // Fallback: scrape page with different approach
-    const pageResp = await fetch(`https://www.youtube.com/watch?v=${videoId}&hl=en`, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-        "Accept": "text/html,application/xhtml+xml",
-        "Accept-Language": "en-US,en;q=0.9",
-      },
-    });
-    const html = await pageResp.text();
-    const m = html.match(/"captionTracks":\[(.*?)\]/);
-    if (m) {
-      const htmlTracks = JSON.parse("[" + m[1] + "]");
-      const en = htmlTracks.find(t => (t.languageCode || "").startsWith("en")) || htmlTracks[0];
-      if (en) {
-        const subResp2 = await fetch(en.baseUrl.replace(/\\u0026/g, "&"));
-        const xml2 = await subResp2.text();
-        const sentences = parseXml(xml2);
-        if (sentences.length > 0) {
-          return res.json({ videoId, sentences, count: sentences.length, method: "scrape", lang: en.languageCode });
-        }
-      }
-    }
-
-    res.json({ sentences: [], error: "no captions found" });
-  } catch (e) {
-    res.status(502).json({ error: e.message || "failed" });
-  }
+  } catch {}
+  return res.json({ sentences: [], error: "no captions found" });
 }
 
 function parseXml(xml) {
